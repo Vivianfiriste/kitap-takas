@@ -1,6 +1,7 @@
 
 // Takas kuralları. Her işlem yetkiyi ve durumu burada denetler.
 // Turso / @libsql/client uyumlu sürüm.
+import { BUILDINGS } from './db.js';
 
 export const CONDITIONS = [
   'Yeni gibi',
@@ -32,6 +33,7 @@ async function execute(db, sql, args = []) {
 }
 
 // Turso transaction yönetimi
+
 async function transaction(db, fn) {
   const tx = await db.transaction('write');
 
@@ -42,8 +44,11 @@ async function transaction(db, fn) {
   } catch (err) {
     await tx.rollback();
     throw err;
+  } finally {
+    tx.close();
   }
 }
+
 
 export function text(value, label, max, required = true) {
   const v = String(value ?? '').trim();
@@ -124,12 +129,25 @@ export async function cancelListing(db, user, id) {
 }
 
 // Teklif oluşturma
+
 export async function createOffer(db, user, listingId, f) {
+  const building = String(f.building ?? '').trim();
+
+  need(
+    BUILDINGS.includes(building),
+    'Lütfen geçerli bir takas binası seç.'
+  );
+
   return transaction(db, async (tx) => {
     const l = await getListing(tx, listingId);
 
     need(l, 'İlan bulunamadı.', 404);
-    need(l.status === 'open', 'Bu ilan artık teklife açık değil.');
+
+    need(
+      l.status === 'open',
+      'Bu ilan artık teklife açık değil.'
+    );
+
     need(
       Number(l.owner_id) !== Number(user.id),
       'Kendi ilanına teklif veremezsin.'
@@ -144,24 +162,37 @@ export async function createOffer(db, user, listingId, f) {
       [listingId, user.id]
     );
 
-    need(!existing.length, 'Bu ilanda zaten bekleyen bir teklifin var.');
+    need(
+      !existing.length,
+      'Bu ilanda zaten bekleyen bir teklifin var.'
+    );
 
     const r = await execute(
       tx,
       `INSERT INTO offers
-       (listing_id, user_id, title, author, condition, message)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+       (
+         listing_id,
+         user_id,
+         title,
+         author,
+         condition,
+         message,
+         building
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         listingId,
         user.id,
         ...bookFields(f),
-        text(f.message, 'Mesaj', 500, false)
+        text(f.message, 'Mesaj', 500, false),
+        building
       ]
     );
 
     return Number(r.lastInsertRowid);
   });
 }
+
 
 // Teklif bilgisi
 async function getOffer(db, id) {
@@ -224,25 +255,39 @@ export async function rejectOffer(db, user, id) {
 }
 
 // Boş kutuları bulma
-export async function freeBoxes(db) {
+
+export async function freeBoxes(db, building = null) {
   return query(
     db,
     `SELECT * FROM boxes b
      WHERE b.active = 1
+
+     AND (? IS NULL OR b.location = ?)
+
      AND NOT EXISTS (
        SELECT 1 FROM swaps s
        WHERE s.status IN ('active', 'problem')
        AND (
-         (s.owner_box = b.id AND s.offerer_picked_at IS NULL)
+         (
+           s.owner_box = b.id
+           AND s.offerer_picked_at IS NULL
+         )
          OR
-         (s.offerer_box = b.id AND s.owner_picked_at IS NULL)
+         (
+           s.offerer_box = b.id
+           AND s.owner_picked_at IS NULL
+         )
        )
      )
-     ORDER BY b.id`
+
+     ORDER BY b.id`,
+    [building, building]
   );
 }
 
+
 // Teklifi kabul etme ve iki kutuyu rezerve etme
+
 export async function acceptOffer(db, user, id) {
   return transaction(db, async (tx) => {
     const o = await getOffer(tx, id);
@@ -254,35 +299,53 @@ export async function acceptOffer(db, user, id) {
     );
 
     need(
-      o.status === 'pending' && o.listing_status === 'open',
+      o.status === 'pending' &&
+      o.listing_status === 'open',
       'Bu teklif artık kabul edilemez.'
     );
 
-    need(!o.offerer_banned, 'Teklifi veren hesap engellenmiş.');
+    need(
+      !o.offerer_banned,
+      'Teklifi veren hesap engellenmiş.'
+    );
 
-    const boxes = await freeBoxes(tx);
+    need(
+      BUILDINGS.includes(o.building),
+      'Bu teklifte bina seçilmemiş. Yeni teklif gönderilmesi gerekiyor.'
+    );
+
+    const boxes = await freeBoxes(tx, o.building);
 
     need(
       boxes.length >= 2,
-      'Şu anda iki boş kutu yok. Kutular boşalınca tekrar dene.'
+      `${o.building} binasında şu anda iki boş kutu yok. Kutular boşalınca tekrar dene.`
     );
 
     await execute(
       tx,
-      "UPDATE offers SET status = 'accepted' WHERE id = ?",
+      `UPDATE offers
+       SET status = 'accepted'
+       WHERE id = ?`,
       [id]
     );
 
     await execute(
       tx,
-      "UPDATE listings SET status = 'reserved' WHERE id = ?",
+      `UPDATE listings
+       SET status = 'reserved'
+       WHERE id = ?`,
       [o.listing_id]
     );
 
     const r = await execute(
       tx,
       `INSERT INTO swaps
-       (listing_id, offer_id, owner_box, offerer_box)
+       (
+         listing_id,
+         offer_id,
+         owner_box,
+         offerer_box
+       )
        VALUES (?, ?, ?, ?)`,
       [
         o.listing_id,
@@ -295,6 +358,7 @@ export async function acceptOffer(db, user, id) {
     return Number(r.lastInsertRowid);
   });
 }
+
 
 // Takas sorgusu
 const SWAP_SQL = `

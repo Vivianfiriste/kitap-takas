@@ -8,6 +8,14 @@ if (existsSync('.env')) {
   loadEnvFile('.env');
 }
 
+// Takas yapılabilecek binalar
+export const BUILDINGS = Object.freeze([
+  'Ambar',
+  'Fabrika',
+  'Lab',
+  'Çelik'
+]);
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY,
@@ -47,6 +55,10 @@ CREATE TABLE IF NOT EXISTS offers (
   author TEXT NOT NULL,
   condition TEXT NOT NULL,
   message TEXT NOT NULL DEFAULT '',
+
+  building TEXT
+    CHECK (building IN ('Ambar','Fabrika','Lab','Çelik')),
+
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','accepted','rejected','withdrawn','cancelled')),
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -80,6 +92,35 @@ CREATE TABLE IF NOT EXISTS swaps (
 );
 `;
 
+// Mevcut veritabanını veri kaybetmeden güncelle
+async function migrateDb(db) {
+  await transaction(db, async (tx) => {
+    const result = await tx.execute(
+      'PRAGMA table_info(offers)'
+    );
+
+    const hasBuilding = result.rows.some(
+      (column) => column.name === 'building'
+    );
+
+    // Bina sütunu yoksa oluştur
+    if (!hasBuilding) {
+      await tx.execute(`
+        ALTER TABLE offers
+        ADD COLUMN building TEXT
+        CHECK (
+          building IN ('Ambar','Fabrika','Lab','Çelik')
+        )
+      `);
+
+      console.log(
+        'Veritabanına bina seçimi özelliği eklendi.'
+      );
+    }
+  });
+}
+
+// Turso veritabanı bağlantısı
 export async function openDb() {
   const url = process.env.TURSO_DATABASE_URL;
   const authToken = process.env.TURSO_AUTH_TOKEN;
@@ -96,10 +137,13 @@ export async function openDb() {
   });
 
   try {
-    // Veritabanı tablolarını oluştur
+    // Eksik tabloları oluştur
     await db.executeMultiple(SCHEMA);
 
-    // İlk açılışta örnek kutuları oluştur
+    // Mevcut veritabanını güncelle
+    await migrateDb(db);
+
+    // İlk açılışta kutuları oluştur
     await transaction(db, async (tx) => {
       const result = await tx.execute(
         'SELECT COUNT(*) AS n FROM boxes'
@@ -121,7 +165,9 @@ export async function openDb() {
       }
     });
 
-    console.log('Turso veritabanına başarıyla bağlanıldı.');
+    console.log(
+      'Turso veritabanına başarıyla bağlanıldı.'
+    );
 
     return db;
 
@@ -131,16 +177,21 @@ export async function openDb() {
   }
 }
 
+// Güvenli veritabanı işlemleri
 export async function transaction(db, fn) {
   const tx = await db.transaction('write');
 
   try {
     const result = await fn(tx);
+
     await tx.commit();
+
     return result;
+
   } catch (err) {
     await tx.rollback();
     throw err;
+
   } finally {
     tx.close();
   }
